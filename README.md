@@ -2,7 +2,7 @@
 
 CGF file format plugin for importing in blender.
 
-**Recommand use blender 3.0+**, i was working on blender 3.6.
+**Recommand use blender 5.0+**, i was working on blender 5.0.
 
 ## Setup
 
