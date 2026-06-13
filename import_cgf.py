@@ -15,7 +15,73 @@ import bmesh
 from math import *
 from mathutils import *
 
-from bpy_extras.wm_utils.progress_report import ProgressReport, ProgressReportSubstep
+try:
+    # Removed in Blender 4.0+
+    from bpy_extras.wm_utils.progress_report import ProgressReport, ProgressReportSubstep
+except ImportError:
+    # Minimal compatibility shim. Provides only the subset of the
+    # ProgressReport API used by this importer (context manager + the
+    # enter_substeps / leave_substeps / step methods). It reports progress to
+    # the console and, when available, to the window manager progress bar.
+    class ProgressReport:
+        def __init__(self, wm=None):
+            self.wm = wm
+            self._depth = 0
+            self._started = False
+
+        def __enter__(self):
+            try:
+                if self.wm is not None:
+                    self.wm.progress_begin(0, 1)
+                    self._started = True
+            except Exception:
+                self._started = False
+            return self
+
+        def __exit__(self, exc_type, exc_value, tb):
+            try:
+                if self._started and self.wm is not None:
+                    self.wm.progress_end()
+            except Exception:
+                pass
+            return False
+
+        def enter_substeps(self, nbr, msg=None):
+            self._depth += 1
+            if msg:
+                print(("  " * self._depth) + str(msg))
+
+        def step(self, msg=None, nbr=1):
+            if msg:
+                print(("  " * self._depth) + str(msg))
+            try:
+                if self._started and self.wm is not None:
+                    self.wm.progress_update(0)
+            except Exception:
+                pass
+
+        def leave_substeps(self, msg=None):
+            if msg:
+                print(("  " * self._depth) + str(msg))
+            if self._depth > 0:
+                self._depth -= 1
+
+    class ProgressReportSubstep:
+        def __init__(self, report, nbr, msg=None, final_msg=None):
+            self.report = report
+            self.msg = msg
+
+        def __enter__(self):
+            self.report.enter_substeps(1, self.msg)
+            return self
+
+        def __exit__(self, exc_type, exc_value, tb):
+            self.report.leave_substeps()
+            return False
+
+        def step(self, msg=None):
+            self.report.step(msg)
+
 from pyffi.formats.cgf import CgfFormat
 
 
@@ -185,7 +251,12 @@ class ImportCGF:
 
         ma_wrap.base_color = diffuse_color
         ma_wrap.specular = sum(specular_color) / 3
-        ma_wrap.specular_tint = chunk.spec_level
+        # "Specular Tint" changed from a float (pre-4.0) to an RGB color (4.0+).
+        try:
+            ma_wrap.specular_tint = chunk.spec_level
+        except TypeError:
+            _st = float(chunk.spec_level)
+            ma_wrap.specular_tint = (_st, _st, _st)
         ma_wrap.roughness = int((1.0 - chunk.spec_shininess) * 8.0)
         # ma_wrap.metallic = sum(ambient_color) / 3
 
@@ -204,12 +275,49 @@ class ImportCGF:
 
         def load_material_image(image_path, alias_name=None, reuse_images: bool = False):
             print("load_material_image: %s" % image_path)
-            filepath = image_path
-            if not os.path.isabs(image_path):
-                filepath = os.path.join(project_root, image_path)
-            if not os.path.exists(filepath):
-                filepath = os.path.join(
-                    project_root, os.path.basename(image_path))
+
+            # Normalize path separators (CGF stores Windows-style paths).
+            image_path = image_path.replace('\\', '/')
+
+            # Build a list of candidate locations to search, in priority order.
+            possible_paths = []
+            if os.path.isabs(image_path):
+                possible_paths.append(image_path)
+            else:
+                cgf_dir = os.path.dirname(self.filepath) if self.filepath else ''
+                # project root + relative path
+                if project_root:
+                    possible_paths.append(os.path.join(project_root, image_path))
+                # CGF directory + relative path
+                if cgf_dir:
+                    possible_paths.append(os.path.join(cgf_dir, image_path))
+                # project root + just the filename
+                if project_root:
+                    possible_paths.append(os.path.join(
+                        project_root, os.path.basename(image_path)))
+                # CGF directory + just the filename (common for AION props
+                # where the .dds sits next to the .cgf)
+                if cgf_dir:
+                    possible_paths.append(os.path.join(
+                        cgf_dir, os.path.basename(image_path)))
+                # Walk up from the CGF directory looking for the relative path,
+                # to catch textures kept in a sibling/parent directory.
+                if cgf_dir:
+                    current_dir = cgf_dir
+                    while current_dir and current_dir != os.path.dirname(current_dir):
+                        possible_paths.append(
+                            os.path.join(current_dir, image_path))
+                        current_dir = os.path.dirname(current_dir)
+
+            # Pick the first candidate that exists; otherwise fall back to the
+            # first candidate so load_image can still report a sensible path.
+            filepath = None
+            for path in possible_paths:
+                if os.path.exists(path):
+                    filepath = path
+                    break
+            if filepath is None:
+                filepath = possible_paths[0] if possible_paths else image_path
 
             filepath = filepath.replace('\\', '/').replace('//', '/')
 
@@ -228,7 +336,18 @@ class ImportCGF:
                     image = bpy.data.images.get(base_name)
 
             if image is None:
-                image = load_image(base_name, dir_name)
+                # Don't let a single missing/broken texture abort the whole
+                # material (and therefore the mesh) import.
+                try:
+                    image = load_image(base_name, dir_name)
+                    if image is None:
+                        print("Warning: Texture '%s' not found in '%s'. "
+                              "Skipping texture." % (base_name, dir_name))
+                except Exception as e:
+                    print("Warning: Failed to load texture '%s': %s. "
+                          "Skipping texture." % (base_name, str(e)))
+                    image = None
+
             if not alias_name:
                 alias_name = os.path.basename(image_path)
 
@@ -242,47 +361,64 @@ class ImportCGF:
             if determine_texture_map(chunk, 'tex_o'):
                 (alias_name, image) = load_material_image(to_str(chunk.tex_o.long_name), to_str(
                     chunk.tex_o.name) if chunk.tex_o.name else None, reuse_images)
-
                 # opacity_texture = node_shader_utils.ShaderImageTextureWrapper(ma_wrap, ma_wrap.node_principled_bsdf, ma_wrap.node_principled_bsdf.inputs['Alpha'])
                 # opacity_texture.image = image
                 # opacity_texture.texcoords = 'UV'
-                ma_wrap.alpha_texture.image = image
-                ma_wrap.alpha_texture.texcoords = 'UV'
-                ma_wrap.material.node_tree.links.new(
-                    ma_wrap.node_principled_bsdf.inputs['Alpha'], ma_wrap.alpha_texture.node_image.outputs['Alpha'])
-                has_opacity_texture = True
+                if image is not None:
+                    ma_wrap.alpha_texture.image = image
+                    ma_wrap.alpha_texture.texcoords = 'UV'
+                    ma_wrap.material.node_tree.links.new(
+                        ma_wrap.node_principled_bsdf.inputs['Alpha'], ma_wrap.alpha_texture.node_image.outputs['Alpha'])
+                    has_opacity_texture = True
+                else:
+                    print("Warning: Opacity texture '%s' is missing. Using default alpha." % alias_name)
 
             if determine_texture_map(chunk, 'tex_d'):
                 (alias_name, image) = load_material_image(to_str(chunk.tex_d.long_name),
                                                           to_str(chunk.tex_d.name) if chunk.tex_d.name else None, reuse_images)
-                ma_wrap.base_color_texture.image = image
-                ma_wrap.base_color_texture.texcoords = 'UV'
+                if image is not None:
+                    ma_wrap.base_color_texture.image = image
+                    ma_wrap.base_color_texture.texcoords = 'UV'
 
-                if not has_opacity_texture and (chunk.opacity < 1.0 or alpha_test):
-                    ma_wrap.material.node_tree.links.new(
-                        ma_wrap.node_principled_bsdf.inputs['Alpha'], ma_wrap.base_color_texture.node_image.outputs['Alpha'])
+                    if not has_opacity_texture and (chunk.opacity < 1.0 or alpha_test):
+                        ma_wrap.material.node_tree.links.new(
+                            ma_wrap.node_principled_bsdf.inputs['Alpha'], ma_wrap.base_color_texture.node_image.outputs['Alpha'])
+                else:
+                    print("Warning: Diffuse texture '%s' is missing. Using base color only." % alias_name)
 
             if determine_texture_map(chunk, 'tex_a'):
                 (alias_name, image) = load_material_image(to_str(chunk.tex_a.long_name), to_str(
                     chunk.tex_a.name) if chunk.tex_a.name else None, reuse_images)
-                ma_wrap.emission_color_texture.image = image
-                ma_wrap.emission_color_texture.texcoords = 'UV'
+                if image is not None:
+                    ma_wrap.emission_color_texture.image = image
+                    ma_wrap.emission_color_texture.texcoords = 'UV'
+                else:
+                    print("Warning: Emission texture '%s' is missing. Using default emission." % alias_name)
             if determine_texture_map(chunk, 'tex_s'):
                 (alias_name, image) = load_material_image(to_str(chunk.tex_s.long_name), to_str(
                     chunk.tex_s.name) if chunk.tex_s.name else None, reuse_images)
-                ma_wrap.specular_texture.image = image
-                ma_wrap.specular_texture.texcoords = 'UV'
+                if image is not None:
+                    ma_wrap.specular_texture.image = image
+                    ma_wrap.specular_texture.texcoords = 'UV'
+                else:
+                    print("Warning: Specular texture '%s' is missing. Using default specular." % alias_name)
 
             if determine_texture_map(chunk, 'tex_b'):
                 (alias_name, image) = load_material_image(to_str(chunk.tex_b.long_name), to_str(
                     chunk.tex_b.name) if chunk.tex_b.name else None, reuse_images)
-                ma_wrap.normalmap_texture.image = image
-                ma_wrap.normalmap_texture.texcoords = 'UV'
+                if image is not None:
+                    ma_wrap.normalmap_texture.image = image
+                    ma_wrap.normalmap_texture.texcoords = 'UV'
+                else:
+                    print("Warning: Normal map texture '%s' is missing. Skipping." % alias_name)
             if determine_texture_map(chunk, 'tex_g'):
                 (alias_name, image) = load_material_image(to_str(chunk.tex_g.long_name), to_str(
                     chunk.tex_g.name) if chunk.tex_g.name else None, reuse_images)
-                ma_wrap.roughness_texture.image = image
-                ma_wrap.roughness_texture.texcoords = 'UV'
+                if image is not None:
+                    ma_wrap.roughness_texture.image = image
+                    ma_wrap.roughness_texture.texcoords = 'UV'
+                else:
+                    print("Warning: Roughness texture '%s' is missing. Skipping." % alias_name)
             if determine_texture_map(chunk, 'tex_f'):
                 print('No implemented for tex_f.');
                 pass
@@ -292,8 +428,11 @@ class ImportCGF:
             if determine_texture_map(chunk, 'tex_r'):
                 (alias_name, image) = load_material_image(to_str(chunk.tex_r.long_name), to_str(
                     chunk.tex_r.name) if chunk.tex_r.name else None, reuse_images)
-                ma_wrap.metallic_texture.image = image
-                ma_wrap.metallic_texture.texcoords = 'UV'
+                if image is not None:
+                    ma_wrap.metallic_texture.image = image
+                    ma_wrap.metallic_texture.texcoords = 'UV'
+                else:
+                    print("Warning: Metallic texture '%s' is missing. Skipping." % alias_name)
             if determine_texture_map(chunk, 'tex_subsurf'):
                 print('No implemented for tex_subsurf.');
                 pass
@@ -303,12 +442,19 @@ class ImportCGF:
 
         if chunk.opacity < 1.0:
             ma_wrap.alpha = chunk.opacity
-            mat.blend_method = 'BLEND'
-            mat.shadow_method = 'HASHED'
+            # blend_method / shadow_method were removed in Blender 4.2 (EEVEE
+            # Next); guard so import still works on 4.2+/5.1+.
+            if hasattr(mat, "blend_method"):
+                mat.blend_method = 'BLEND'
+            if hasattr(mat, "shadow_method"):
+                mat.shadow_method = 'HASHED'
         elif alpha_test:
-            mat.blend_method = 'CLIP'
-            mat.shadow_method = 'CLIP'
-            mat.alpha_threshold = chunk.alpha_test
+            if hasattr(mat, "blend_method"):
+                mat.blend_method = 'CLIP'
+            if hasattr(mat, "shadow_method"):
+                mat.shadow_method = 'CLIP'
+            if hasattr(mat, "alpha_threshold"):
+                mat.alpha_threshold = chunk.alpha_test
 
         if chunk.flags.two_sided == 1:
             mat.use_backface_culling = False
@@ -365,7 +511,11 @@ class ImportCGF:
         use_mat_ids = []
 
         if verts_nor and me.loops:
-            me.create_normals_split()
+            # create_normals_split() was removed in Blender 4.1; custom split
+            # normals can now be assigned directly via normals_split_custom_set
+            # below without pre-creating the layer.
+            if hasattr(me, "create_normals_split"):
+                me.create_normals_split()
             # or me.split_faces()
 
         if verts_tex and me.polygons:
@@ -378,6 +528,11 @@ class ImportCGF:
         context_material_old = -1  # avoid a dict lookup
         mat = 0  # rare case it may be un-initialized
         material_index = 0
+
+        # Custom split normals are applied AFTER me.validate() further below
+        # (see the comment there): validate() must run first so the mesh is
+        # valid, otherwise normals_split_custom_set() can HARD-CRASH Blender on
+        # malformed CGF meshes (e.g. some level brush models).
 
         def get_smooth_group_indices():
             if mesh_chunk.faces:
@@ -418,8 +573,7 @@ class ImportCGF:
 
             if verts_nor:
                 for face_idx, face_uvidx, lidx in zip(face, uv_face, blen_poly.loop_indices):
-                    me.loops[lidx].normal[:] = verts_nor[0 if (
-                        face_idx is ...) else face_idx]
+                    # (custom normals are applied after validate(), below)
                     if blen_uvs is not None:
                         blen_uvs.data[lidx].uv = verts_tex[0 if (
                             face_uvidx is ...) else face_uvidx]
@@ -447,13 +601,24 @@ class ImportCGF:
         me.validate(clean_customdata=False)
         me.update(calc_edges=False)
 
-        if verts_nor:
-            clnors = array.array('f', [0.0] * (len(me.loops) * 3))
-            me.loops.foreach_get("normal", clnors)
-
-            me.normals_split_custom_set(tuple(zip(*(iter(clnors),) * 3)))
-            # me.use_auto_smooth = True
-            # me.show_edge_sharp = True
+        # Apply custom split normals AFTER validate(). Two reasons:
+        #  1) normals_split_custom_set() on an UNVALIDATED/invalid mesh can
+        #     hard-crash Blender (segfault) -- this happened on some level
+        #     brush CGFs. validate() cleans the topology first.
+        #  2) validate() may delete degenerate loops/faces, changing the loop
+        #     count; building the list from the *validated* mesh keeps the
+        #     count matched (avoids "Number of custom normals is not number of
+        #     loops"). MeshLoop.normal is read-only since 4.1, so we can't use
+        #     the old write-then-read-back approach.
+        # CGF stores one normal per vertex, so each loop's normal is the normal
+        # of the vertex it references.
+        if verts_nor and me.loops:
+            nv = len(verts_nor)
+            loop_normals = [verts_nor[lp.vertex_index]
+                            if lp.vertex_index < nv else (0.0, 0.0, 1.0)
+                            for lp in me.loops]
+            me.normals_split_custom_set(loop_normals)
+            # me.use_auto_smooth removed in 4.1; not needed for custom normals.
 
         ob = bpy.data.objects.new(me.name, me)
         new_objects[mesh_chunk] = ob
